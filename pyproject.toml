@@ -1,0 +1,11 @@
+[project]
+name = "dt-ttt"
+version = "0.1.0"
+description = "Decision Transformer applied to Tic Tac Toe."
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=2.3.4",
+    "tensorboard>=2.20.0",
+    "torch>=2.9.0",
+]
