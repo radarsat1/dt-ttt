@@ -35,6 +35,8 @@ class Config:
     # Game settings
     board_size: int = 9
     max_seq_len: int = 9 # Maximum number of moves in a game
+    online_generation: bool = True
+    ignore_draws: bool = False
 
     # Filled by argparse
     args: dict = field(default_factory=dict)
@@ -187,40 +189,61 @@ def run_rollout(agent1, agent2) -> List[Tuple[np.ndarray, int, int]]:
 
     return full_rollout
 
+
 # 5. PyTorch DataLoader
+
+def _process_single_rollout(rollout: List, config: Config) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Processes a single game rollout into padded tensors."""
+    states = np.array([s for s, a, r in rollout])
+    actions = np.array([a for s, a, r in rollout])
+    rewards = np.array([r for s, a, r in rollout])
+    rtgs = np.cumsum(rewards[::-1])[::-1]
+
+    padded_states = np.zeros((config.max_seq_len, config.board_size))
+    padded_states[:len(states)] = states
+
+    padded_actions = np.zeros(config.max_seq_len, dtype=int)
+    padded_actions[:len(actions)] = actions
+
+    padded_rtgs = np.zeros(config.max_seq_len)
+    padded_rtgs[:len(rtgs)] = rtgs
+
+    return (torch.tensor(padded_states, dtype=torch.long),
+            torch.tensor(padded_actions, dtype=torch.long),
+            torch.tensor(padded_rtgs, dtype=torch.float32).unsqueeze(-1))
+
+class OnlineRolloutDataset(Dataset):
+    """Dataset that generates game rollouts on the fly."""
+    def __init__(self, num_rollouts: int, config: Config):
+        self.num_rollouts = num_rollouts
+        self.config = config
+        self.agent1 = RandomAgent()
+        self.agent2 = RandomAgent()
+
+    def __len__(self):
+        # This defines the number of items per "epoch"
+        return self.num_rollouts
+
+    def __getitem__(self, idx):
+        # Generate a new rollout for each item request
+        rollout = run_rollout(self.agent1, self.agent2)
+
+        # If ignoring draws, loop until a decisive game is generated
+        if self.config.ignore_draws:
+            while rollout[-1][2] == 0:
+                rollout = run_rollout(self.agent1, self.agent2)
+
+        return _process_single_rollout(rollout, self.config)
+
 class RolloutDataset(Dataset):
-    """Dataset for storing and processing game rollouts."""
+    """Dataset for storing and processing pre-generated game rollouts."""
     def __init__(self, rollouts: List, config: Config):
         self.config = config
-        self.states, self.actions, self.rtgs = self._process_rollouts(rollouts)
+        processed_rollouts = [_process_single_rollout(r, config) for r in rollouts]
 
-    def _process_rollouts(self, rollouts):
-        all_states, all_actions, all_rtgs = [], [], []
-        for rollout in rollouts:
-            states = np.array([s for s, a, r in rollout])
-            actions = np.array([a for s, a, r in rollout])
-            rewards = np.array([r for s, a, r in rollout])
-
-            # Calculate returns-to-go
-            rtgs = np.cumsum(rewards[::-1])[::-1]
-
-            # Pad sequences to max_seq_len
-            padded_states = np.zeros((self.config.max_seq_len, self.config.board_size))
-            padded_states[:len(states)] = states
-
-            padded_actions = np.zeros(self.config.max_seq_len, dtype=int)
-            padded_actions[:len(actions)] = actions
-
-            padded_rtgs = np.zeros(self.config.max_seq_len)
-            padded_rtgs[:len(rtgs)] = rtgs
-
-            all_states.append(padded_states)
-            all_actions.append(padded_actions)
-            all_rtgs.append(padded_rtgs)
-
-        return (torch.tensor(np.array(all_states), dtype=torch.long),
-                torch.tensor(np.array(all_actions), dtype=torch.long),
-                torch.tensor(np.array(all_rtgs), dtype=torch.float32).unsqueeze(-1))
+        self.states = torch.stack([r[0] for r in processed_rollouts])
+        self.actions = torch.stack([r[1] for r in processed_rollouts])
+        self.rtgs = torch.stack([r[2] for r in processed_rollouts])
 
     def __len__(self):
         return len(self.states)
@@ -229,14 +252,36 @@ class RolloutDataset(Dataset):
         return self.states[idx], self.actions[idx], self.rtgs[idx]
 
 def create_dataloader(config: Config, is_validation=False) -> DataLoader:
-    """Generates rollouts and creates a DataLoader."""
+    """Creates a DataLoader with either online or offline data generation."""
     num_games = config.val_rollouts if is_validation else config.num_rollouts
-    agent1 = RandomAgent()
-    agent2 = RandomAgent()
 
-    rollouts = [run_rollout(agent1, agent2) for _ in range(num_games)]
-    dataset = RolloutDataset(rollouts, config)
-    return DataLoader(dataset, batch_size=config.batch_size, shuffle=not is_validation)
+    # Validation always uses a fixed (offline) dataset for consistency
+    if config.online_generation and not is_validation:
+        print("Using online data generation for training.")
+        dataset = OnlineRolloutDataset(num_games, config)
+        # Shuffling is not needed for online data as every sample is new
+        return DataLoader(dataset, batch_size=config.batch_size, shuffle=False)
+    else:
+        if is_validation:
+            print("Using offline data generation for validation.")
+        else:
+            print("Using offline data generation for training.")
+
+        agent1, agent2 = RandomAgent(), RandomAgent()
+        rollouts = []
+
+        target_games = num_games
+        if config.ignore_draws:
+            while len(rollouts) < target_games:
+                rollout = run_rollout(agent1, agent2)
+                if rollout[-1][2] != 0:
+                    rollouts.append(rollout)
+        else:
+            rollouts = [run_rollout(agent1, agent2) for _ in range(target_games)]
+
+        dataset = RolloutDataset(rollouts, config)
+        return DataLoader(dataset, batch_size=config.batch_size,
+                          shuffle=not is_validation, num_workers=10)
 
 
 # 6. Decision Transformer Model
@@ -440,9 +485,12 @@ def main():
     parser = argparse.ArgumentParser(description="Train a Decision Transformer for Tic-Tac-Toe.")
 
     # Add arguments for each field in the Config dataclass
-    for field_name, field_type in Config.__annotations__.items():
+    for field_name, field_info in Config.__dataclass_fields__.items():
         if field_name == 'args': continue
-        parser.add_argument(f"--{field_name}", type=field_type, default=getattr(config, field_name))
+        if field_info.type == bool:
+            parser.add_argument(f"--{field_name}", action=argparse.BooleanOptionalAction, default=field_info.default)
+        else:
+            parser.add_argument(f"--{field_name}", type=field_info.type, default=field_info.default)
 
     args = parser.parse_args()
 
