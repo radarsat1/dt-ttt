@@ -91,7 +91,7 @@ class TicTacToe:
 # 3. Agents
 class RandomAgent:
     """An agent that chooses moves randomly."""
-    def get_move(self, game: TicTacToe) -> int:
+    def get_move(self, game: TicTacToe, state_hist=None, action_hist=None, rtg_hist=None) -> int:
         return random.choice(game.get_available_moves())
 
 class ModelAgent:
@@ -352,26 +352,38 @@ def validate(model: nn.Module, config: Config, device: torch.device, writer: Sum
     model_agent = ModelAgent(model, device)
     random_agent = RandomAgent()
 
-    wins, losses, draws = 0, 0, 0
+    wins_p1, wins_p2, losses, draws = 0, 0, 0, 0
+    model_as_p1_count = 0
+    model_as_p2_count = 0
 
     for _ in range(config.val_rollouts):
         game = TicTacToe()
+        model_plays_as = random.choice([1, -1]) # Randomly assign model as player 1 or player 2
+        if model_plays_as == 1:
+            model_as_p1_count += 1
+        else:
+            model_as_p2_count += 1
 
         state_hist, action_hist = [], []
         # We start with a target return of 1.0 (a win)
         target_return = 1.0
         rtg_hist = [target_return]
 
+        # Assign agents based on `model_plays_as`
+        agents = {1: None, -1: None}
+        if model_plays_as == 1:
+            agents[1] = model_agent
+            agents[-1] = random_agent
+        else:
+            agents[1] = random_agent
+            agents[-1] = model_agent
+
         done = False
         while not done:
             state_before_move = game.get_state()
 
-            if game.current_player == 1:
-                # Model's turn
-                move = model_agent.get_move(game, state_hist, action_hist, rtg_hist)
-            else:
-                # Random agent's turn
-                move = random_agent.get_move(game)
+            current_agent = agents[game.current_player]
+            move = current_agent.get_move(game, state_hist, action_hist, rtg_hist)
 
             # Record the state and action that led to the new state
             state_hist.append(state_before_move)
@@ -385,13 +397,30 @@ def validate(model: nn.Module, config: Config, device: torch.device, writer: Sum
             rtg_hist.append(rtg_hist[-1])
 
         winner = game.check_winner()
-        if winner == 1: wins += 1
-        elif winner == -1: losses += 1
+        if winner is None:
+            # This case should ideally not be reached if `done` is True and no winner is found (implies draw)
+            # but explicitly handling it for robustness.
+            draws += 1
+        elif winner == model_plays_as:
+            if model_plays_as == 1:
+                wins_p1 += 1
+            else:
+                wins_p2 += 1
+        elif winner == -model_plays_as: losses += 1
         else: draws += 1
 
-    win_rate = wins / config.val_rollouts
-    writer.add_scalar("WinRate/validation", win_rate, epoch)
-    print(f"Validation Win Rate: {win_rate:.2f} (Wins: {wins}, Losses: {losses}, Draws: {draws})")
+    win_rate_p1 = wins_p1 / max(1, model_as_p1_count)
+    win_rate_p2 = wins_p2 / max(1, model_as_p2_count)
+    overall_wins = wins_p1 + wins_p2
+    overall_games = model_as_p1_count + model_as_p2_count
+    overall_win_rate = overall_wins / max(1, overall_games)
+
+    writer.add_scalar("WinRate/validation_P1", win_rate_p1, epoch)
+    writer.add_scalar("WinRate/validation_P2", win_rate_p2, epoch)
+    writer.add_scalar("WinRate/validation_Overall", overall_win_rate, epoch)
+    print(f"Validation Win Rate (P1): {win_rate_p1:.2f} (Wins: {wins_p1}, Games: {model_as_p1_count})")
+    print(f"Validation Win Rate (P2): {win_rate_p2:.2f} (Wins: {wins_p2}, Games: {model_as_p2_count})")
+    print(f"Validation Overall Win Rate: {overall_win_rate:.2f} (Wins: {overall_wins}, Losses: {losses}, Draws: {draws})")
 
 def set_seed(seed: int):
     random.seed(seed)
