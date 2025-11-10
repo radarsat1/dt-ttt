@@ -91,22 +91,34 @@ class TicTacToe:
 # 3. Agents
 class RandomAgent:
     """An agent that chooses moves randomly."""
-    def get_move(self, game: TicTacToe, state_hist=None, action_hist=None, rtg_hist=None) -> int:
+    def get_move(self, game: TicTacToe, *args, **kwargs) -> int:
         return random.choice(game.get_available_moves())
 
 class ModelAgent:
-    """An agent that uses a PyTorch model to select moves."""
+    """Base class for an agent that uses a PyTorch model to select moves."""
     def __init__(self, model: nn.Module, device: torch.device):
         self.model = model
         self.device = device
         self.model.eval()
 
     def get_move(self, game: TicTacToe, state_hist, action_hist, rtg_hist) -> int:
-        # Prepare inputs for the Decision Transformer model
-        # The states and rtgs include the current timestep, actions do not yet.
-        states_seq = state_hist + [game.get_state()]
+        raise NotImplementedError
+
+class CanonicalModelAgent(ModelAgent):
+    """A model agent that uses a canonical board representation."""
+    def get_move(self, game: TicTacToe, state_hist, action_hist, rtg_hist) -> int:
+        # Convert the board state to the perspective of the current player
+        canonical_state = game.get_state() * game.current_player
+
+        # The history also needs to be converted to the canonical perspective for the model
+        canonical_state_hist = []
+        turn_player = 1
+        for state in state_hist:
+            canonical_state_hist.append(state * turn_player)
+            turn_player *= -1
+
+        states_seq = canonical_state_hist + [canonical_state]
         actions_seq = action_hist
-        rtgs_seq = rtg_hist
 
         # Pad the actions sequence to match the states sequence length.
         # The value of the padding (e.g., 0) doesn't matter because of the causal mask.
@@ -117,7 +129,7 @@ class ModelAgent:
         max_len = self.model.config.max_seq_len
         states_seq = states_seq[-max_len:]
         actions_seq = actions_seq[-max_len:]
-        rtgs_seq = rtgs_seq[-max_len:]
+        rtgs_seq = rtg_hist[-max_len:]
 
         states = torch.tensor(states_seq, dtype=torch.long).unsqueeze(0).to(self.device)
         actions = torch.tensor(actions_seq, dtype=torch.long).unsqueeze(0).to(self.device)
@@ -126,24 +138,21 @@ class ModelAgent:
         with torch.no_grad():
             action_preds = self.model(states, actions, rtgs)
 
-        # Get the logits for the last predicted action in the sequence
         logits = action_preds[0, -1]
 
-        # Mask unavailable moves
         available_moves = game.get_available_moves()
         mask = torch.ones_like(logits) * -float('inf')
         mask[available_moves] = 0
         logits += mask
 
-        # Sample from the resulting distribution
         dist = torch.distributions.Categorical(logits=logits)
         return dist.sample().item()
 
 # 4. Rollout Function
 def run_rollout(agent1, agent2) -> List[Tuple[np.ndarray, int, int]]:
     """
-    Simulates a single game between two agents and records the trajectory.
-    Returns a list of (state, action, reward) tuples.
+    Simulates a single game between two agents and records the trajectory
+    from a canonical perspective (current player is always '1').
     """
     game = TicTacToe()
     trajectory = []
@@ -152,21 +161,28 @@ def run_rollout(agent1, agent2) -> List[Tuple[np.ndarray, int, int]]:
     while not is_done:
         current_agent = agent1 if game.current_player == 1 else agent2
 
-        state_before_move = game.get_state()
+        # The state is stored from the perspective of the current player.
+        canonical_state = game.get_state() * game.current_player
         action = current_agent.get_move(game)
 
-        _, reward, is_done = game.make_move(action)
+        _, _, is_done = game.make_move(action)
 
-        trajectory.append((state_before_move, action, reward))
+        # Store the canonical state with the action and a placeholder for the reward.
+        trajectory.append((canonical_state, action, 0))
 
     # Distribute the final reward back through the trajectory
-    final_reward = trajectory[-1][-1]
+    final_winner = game.check_winner()
     full_rollout = []
+
     for i, (state, action, _) in enumerate(trajectory):
-        # Player 1's reward is the final outcome
-        # Player 2's reward is the inverted outcome
-        player_at_turn = 1 if i % 2 == 0 else -1
-        reward = final_reward * player_at_turn
+        turn_player = 1 if i % 2 == 0 else -1
+
+        if final_winner == 0:
+            reward = 0
+        else:
+            # If the player for this turn is the winner, reward is 1, else -1.
+            reward = 1 if turn_player == final_winner else -1
+
         full_rollout.append((state, action, reward))
 
     return full_rollout
@@ -349,7 +365,8 @@ def train(config: Config):
 def validate(model: nn.Module, config: Config, device: torch.device, writer: SummaryWriter, epoch: int):
     """Evaluates the model's performance against a random agent."""
     model.eval()
-    model_agent = ModelAgent(model, device)
+    # Use the new agent that understands canonical states
+    model_agent = CanonicalModelAgent(model, device)
     random_agent = RandomAgent()
 
     wins_p1, wins_p2, losses, draws = 0, 0, 0, 0
@@ -369,14 +386,8 @@ def validate(model: nn.Module, config: Config, device: torch.device, writer: Sum
         target_return = 1.0
         rtg_hist = [target_return]
 
-        # Assign agents based on `model_plays_as`
-        agents = {1: None, -1: None}
-        if model_plays_as == 1:
-            agents[1] = model_agent
-            agents[-1] = random_agent
-        else:
-            agents[1] = random_agent
-            agents[-1] = model_agent
+        agents = {1: model_agent if model_plays_as == 1 else random_agent,
+                  -1: model_agent if model_plays_as == -1 else random_agent}
 
         done = False
         while not done:
@@ -397,17 +408,13 @@ def validate(model: nn.Module, config: Config, device: torch.device, writer: Sum
             rtg_hist.append(rtg_hist[-1])
 
         winner = game.check_winner()
-        if winner is None:
-            # This case should ideally not be reached if `done` is True and no winner is found (implies draw)
-            # but explicitly handling it for robustness.
-            draws += 1
+        if winner == 0:
+            draws +=1
         elif winner == model_plays_as:
-            if model_plays_as == 1:
-                wins_p1 += 1
-            else:
-                wins_p2 += 1
-        elif winner == -model_plays_as: losses += 1
-        else: draws += 1
+            if model_plays_as == 1: wins_p1 += 1
+            else: wins_p2 += 1
+        else: # The winner was the other player
+            losses += 1
 
     win_rate_p1 = wins_p1 / max(1, model_as_p1_count)
     win_rate_p2 = wins_p2 / max(1, model_as_p2_count)
