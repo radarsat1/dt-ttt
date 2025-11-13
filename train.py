@@ -2,7 +2,8 @@ import argparse
 import random
 import numpy as np
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import List, Tuple, Dict
+from collections import defaultdict
 
 import torch
 import torch.nn as nn
@@ -17,7 +18,9 @@ class Config:
     # Experiment settings
     exp_name: str = "dt_tictactoe"
     seed: int = 42
-    num_rollouts: int = 5000
+    # New offline dataset size for advantage calculation
+    num_offline_rollouts: int = 20000
+    num_train_rollouts: int = 5000
     val_rollouts: int = 500
 
     # Model parameters
@@ -103,12 +106,12 @@ class ModelAgent:
         self.device = device
         self.model.eval()
 
-    def get_move(self, game: TicTacToe, state_hist, action_hist, rtg_hist) -> int:
+    def get_move(self, game: TicTacToe, state_hist, action_hist, advantage_hist) -> int:
         raise NotImplementedError
 
 class CanonicalModelAgent(ModelAgent):
     """A model agent that uses a canonical board representation."""
-    def get_move(self, game: TicTacToe, state_hist, action_hist, rtg_hist) -> int:
+    def get_move(self, game: TicTacToe, state_hist, action_hist, advantage_hist) -> int:
         # Convert the board state to the perspective of the current player
         canonical_state = game.get_state() * game.current_player
 
@@ -129,17 +132,11 @@ class CanonicalModelAgent(ModelAgent):
 
         # Truncate all sequences to the model's max context length from the right
         max_len = self.model.config.max_seq_len
-        states_seq = states_seq[-max_len:]
-        actions_seq = actions_seq[-max_len:]
-        rtgs_seq = rtg_hist[-max_len:]
-
+        states_seq, actions_seq, adv_hist = states_seq[-max_len:], actions_seq[-max_len:], advantage_hist[-max_len:]
         states = torch.tensor(states_seq, dtype=torch.long).unsqueeze(0).to(self.device)
         actions = torch.tensor(actions_seq, dtype=torch.long).unsqueeze(0).to(self.device)
-        rtgs = torch.tensor(rtgs_seq, dtype=torch.float32).unsqueeze(0).unsqueeze(-1).to(self.device)
-
-        with torch.no_grad():
-            action_preds = self.model(states, actions, rtgs)
-
+        advantages = torch.tensor(adv_hist, dtype=torch.float32).unsqueeze(0).unsqueeze(-1).to(self.device)
+        with torch.no_grad(): action_preds = self.model(states, actions, advantages)
         logits = action_preds[0, -1]
 
         available_moves = game.get_available_moves()
@@ -168,123 +165,83 @@ def run_rollout(agent1, agent2) -> List[Tuple[np.ndarray, int, int]]:
         action = current_agent.get_move(game)
 
         _, _, is_done = game.make_move(action)
-
-        # Store the canonical state with the action and a placeholder for the reward.
         trajectory.append((canonical_state, action, 0))
+    winner = game.check_winner()
+    return [(s, a, (1 if (i%2==0 and winner==1) or (i%2!=0 and winner==-1) else -1) if winner!=0 else 0) for i, (s,a,_) in enumerate(trajectory)]
 
-    # Distribute the final reward back through the trajectory
-    final_winner = game.check_winner()
-    full_rollout = []
+# 5. Advantage Calculation and DataLoader
+def get_state_key(state: np.ndarray) -> bytes:
+    """Converts a numpy array state to a hashable key."""
+    return state.tobytes()
 
-    for i, (state, action, _) in enumerate(trajectory):
-        turn_player = 1 if i % 2 == 0 else -1
+def calculate_advantage_tables(rollouts: List, config: Config) -> Tuple[Dict, Dict]:
+    """Calculates V(s) and Q(s,a) tables via Monte Carlo estimation."""
+    state_returns = defaultdict(lambda: {'sum': 0.0, 'count': 0})
+    state_action_returns = defaultdict(lambda: {'sum': 0.0, 'count': 0})
 
-        if final_winner == 0:
-            reward = 0
-        else:
-            # If the player for this turn is the winner, reward is 1, else -1.
-            reward = 1 if turn_player == final_winner else -1
+    for rollout in rollouts:
+        rewards = [r for s, a, r in rollout]
+        returns = np.cumsum(rewards[::-1])[::-1]
+        for i, (state, action, reward) in enumerate(rollout):
+            state_key = get_state_key(state)
+            state_action_key = (state_key, action)
+            
+            state_returns[state_key]['sum'] += returns[i]
+            state_returns[state_key]['count'] += 1
+            state_action_returns[state_action_key]['sum'] += returns[i]
+            state_action_returns[state_action_key]['count'] += 1
+            
+    v_table = {k: v['sum'] / v['count'] for k, v in state_returns.items()}
+    q_table = {k: v['sum'] / v['count'] for k, v in state_action_returns.items()}
+    
+    print(f"Calculated V-table for {len(v_table)} states and Q-table for {len(q_table)} state-action pairs.")
+    return v_table, q_table
 
-        full_rollout.append((state, action, reward))
-
-    return full_rollout
-
-
-# 5. PyTorch DataLoader
-
-def _process_single_rollout(rollout: List, config: Config) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Processes a single game rollout into padded tensors."""
-    states = np.array([s for s, a, r in rollout])
-    actions = np.array([a for s, a, r in rollout])
-    rewards = np.array([r for s, a, r in rollout])
-    rtgs = np.cumsum(rewards[::-1])[::-1]
-
-    padded_states = np.zeros((config.max_seq_len, config.board_size))
-    padded_states[:len(states)] = states
-
-    padded_actions = np.zeros(config.max_seq_len, dtype=int)
-    padded_actions[:len(actions)] = actions
-
-    padded_rtgs = np.zeros(config.max_seq_len)
-    padded_rtgs[:len(rtgs)] = rtgs
-
-    return (torch.tensor(padded_states, dtype=torch.long),
-            torch.tensor(padded_actions, dtype=torch.long),
-            torch.tensor(padded_rtgs, dtype=torch.float32).unsqueeze(-1))
-
-class OnlineRolloutDataset(Dataset):
-    """Dataset that generates game rollouts on the fly."""
-    def __init__(self, num_rollouts: int, config: Config):
-        self.num_rollouts = num_rollouts
+class AdvantageRolloutDataset(Dataset):
+    """Dataset that processes rollouts to use advantages instead of RTGs."""
+    def __init__(self, rollouts: List, v_table: Dict, q_table: Dict, config: Config):
         self.config = config
-        self.agent1 = RandomAgent()
-        self.agent2 = RandomAgent()
+        self.advantages, self.states, self.actions = self._process_rollouts(rollouts, v_table, q_table)
 
-    def __len__(self):
-        # This defines the number of items per "epoch"
-        return self.num_rollouts
+    def _process_rollouts(self, rollouts, v_table, q_table):
+        all_advantages, all_states, all_actions = [], [], []
+        for rollout in rollouts:
+            states = [s for s, a, r in rollout]
+            actions = [a for s, a, r in rollout]
+            advantages = []
+            for state, action in zip(states, actions):
+                state_key = get_state_key(state)
+                state_action_key = (state_key, action)
+                q_value = q_table.get(state_action_key, 0.0)
+                v_value = v_table.get(state_key, 0.0)
+                advantages.append(q_value - v_value)
 
-    def __getitem__(self, idx):
-        # Generate a new rollout for each item request
-        rollout = run_rollout(self.agent1, self.agent2)
+            padded_states = np.zeros((self.config.max_seq_len, self.config.board_size))
+            padded_states[:len(states)] = np.array(states)
+            padded_actions = np.zeros(self.config.max_seq_len, dtype=int)
+            padded_actions[:len(actions)] = actions
+            padded_advantages = np.zeros(self.config.max_seq_len)
+            padded_advantages[:len(advantages)] = advantages
+            
+            all_states.append(torch.tensor(padded_states, dtype=torch.long))
+            all_actions.append(torch.tensor(padded_actions, dtype=torch.long))
+            all_advantages.append(torch.tensor(padded_advantages, dtype=torch.float32).unsqueeze(-1))
+            
+        return torch.stack(all_advantages), torch.stack(all_states), torch.stack(all_actions)
 
-        # If ignoring draws, loop until a decisive game is generated
-        if self.config.ignore_draws:
-            while rollout[-1][2] == 0:
-                rollout = run_rollout(self.agent1, self.agent2)
+    def __len__(self): return len(self.states)
+    def __getitem__(self, idx): return self.states[idx], self.actions[idx], self.advantages[idx]
 
-        return _process_single_rollout(rollout, self.config)
+def create_dataloader(v_table, q_table, config: Config, is_validation=False) -> DataLoader:
+    """Creates a dataloader using pre-calculated advantage tables."""
+    num_games = config.val_rollouts if is_validation else config.num_train_rollouts
+    agent1, agent2 = RandomAgent(), RandomAgent()
+    
+    rollouts = [run_rollout(agent1, agent2) for _ in range(num_games)]
+    dataset = AdvantageRolloutDataset(rollouts, v_table, q_table, config)
+    return DataLoader(dataset, batch_size=config.batch_size, shuffle=not is_validation)
 
-class RolloutDataset(Dataset):
-    """Dataset for storing and processing pre-generated game rollouts."""
-    def __init__(self, rollouts: List, config: Config):
-        self.config = config
-        processed_rollouts = [_process_single_rollout(r, config) for r in rollouts]
-
-        self.states = torch.stack([r[0] for r in processed_rollouts])
-        self.actions = torch.stack([r[1] for r in processed_rollouts])
-        self.rtgs = torch.stack([r[2] for r in processed_rollouts])
-
-    def __len__(self):
-        return len(self.states)
-
-    def __getitem__(self, idx):
-        return self.states[idx], self.actions[idx], self.rtgs[idx]
-
-def create_dataloader(config: Config, is_validation=False) -> DataLoader:
-    """Creates a DataLoader with either online or offline data generation."""
-    num_games = config.val_rollouts if is_validation else config.num_rollouts
-
-    # Validation always uses a fixed (offline) dataset for consistency
-    if config.online_generation and not is_validation:
-        print("Using online data generation for training.")
-        dataset = OnlineRolloutDataset(num_games, config)
-        # Shuffling is not needed for online data as every sample is new
-        return DataLoader(dataset, batch_size=config.batch_size, shuffle=False)
-    else:
-        if is_validation:
-            print("Using offline data generation for validation.")
-        else:
-            print("Using offline data generation for training.")
-
-        agent1, agent2 = RandomAgent(), RandomAgent()
-        rollouts = []
-
-        target_games = num_games
-        if config.ignore_draws:
-            while len(rollouts) < target_games:
-                rollout = run_rollout(agent1, agent2)
-                if rollout[-1][2] != 0:
-                    rollouts.append(rollout)
-        else:
-            rollouts = [run_rollout(agent1, agent2) for _ in range(target_games)]
-
-        dataset = RolloutDataset(rollouts, config)
-        return DataLoader(dataset, batch_size=config.batch_size,
-                          shuffle=not is_validation, num_workers=10)
-
-
-# 6. Decision Transformer Model
+# 6. Advantage-Conditioned Decision Transformer
 class DecisionTransformer(nn.Module):
     """A basic Decision Transformer model for Tic-Tac-Toe."""
     def __init__(self, config: Config):
@@ -294,18 +251,9 @@ class DecisionTransformer(nn.Module):
         # Embeddings
         # State: 0 (empty), 1 (player 1), -1 (player 2) -> map to 0, 1, 2
         self.state_encoder = nn.Embedding(3, config.embedding_dim)
-        self.rtg_encoder = nn.Linear(1, config.embedding_dim)
-        self.action_encoder = nn.Embedding(config.board_size, config.embedding_dim)
-        self.pos_encoder = nn.Embedding(config.max_seq_len, config.embedding_dim)
-
-        # Transformer Decoder
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=config.embedding_dim,
-            nhead=config.nhead,
-            dim_feedforward=config.dim_feedforward,
-            dropout=config.dropout,
-            batch_first=True
-        )
+        self.advantage_encoder = nn.Linear(1, config.embedding_dim)
+        self.action_encoder = nn.Embedding(config.board_size, config.embedding_dim); self.pos_encoder = nn.Embedding(config.max_seq_len, config.embedding_dim)
+        decoder_layer = nn.TransformerDecoderLayer(d_model=config.embedding_dim, nhead=config.nhead, dim_feedforward=config.dim_feedforward, dropout=config.dropout, batch_first=True)
         self.transformer_decoder = nn.TransformerDecoder(decoder_layer, num_layers=config.num_decoder_layers)
 
         # Output head
@@ -319,25 +267,22 @@ class DecisionTransformer(nn.Module):
             if isinstance(module, nn.Linear) and module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
 
-    def forward(self, states, actions, rtgs):
+    def forward(self, states, actions, advantages):
         batch_size, seq_len = states.shape[0], states.shape[1]
-
-        # Remap states from {-1, 0, 1} to {0, 1, 2} for embedding
-        states_mapped = states + 1
-        state_embeds = self.state_encoder(states_mapped).sum(dim=2) # Sum embeddings for each cell
-        rtg_embeds = self.rtg_encoder(rtgs)
+        state_embeds = self.state_encoder(states + 1).sum(dim=2)
+        advantage_embeds = self.advantage_encoder(advantages)
         action_embeds = self.action_encoder(actions)
 
         positions = torch.arange(0, seq_len, device=states.device).unsqueeze(0)
         pos_embeds = self.pos_encoder(positions)
 
         # Create the sequence for the transformer
-        # Order: RTG, State, Action
+        # Order: Advantage, State, Action
         # We interleave the embeddings
-        input_embeds = torch.stack((rtg_embeds, state_embeds, action_embeds), dim=2)
+        input_embeds = torch.stack((advantage_embeds, state_embeds, action_embeds), dim=2)
         input_embeds = input_embeds.reshape(batch_size, 3 * seq_len, self.config.embedding_dim)
 
-        # Add positional embeddings. Each (rtg, s, a) triplet gets the same pos embedding
+        # Add positional embeddings. Each (adv, s, a) triplet gets the same pos embedding
         pos_embeds_tripled = pos_embeds.repeat_interleave(3, dim=1)
         input_embeds += pos_embeds_tripled
 
@@ -362,23 +307,33 @@ def train(config: Config):
 
     # Setup
     set_seed(config.seed)
-    train_loader = create_dataloader(config)
 
+    # --- NEW: Pre-calculation step ---
+    print(f"Generating {config.num_offline_rollouts} rollouts for advantage calculation...")
+    agent1, agent2 = RandomAgent(), RandomAgent()
+    offline_rollouts = [run_rollout(agent1, agent2)
+                        for _ in range(config.num_offline_rollouts)]
+    v_table, q_table = calculate_advantage_tables(offline_rollouts, config)
+
+    train_loader = create_dataloader(v_table, q_table, config)
     model = DecisionTransformer(config).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=config.learning_rate)
     loss_fn = nn.CrossEntropyLoss()
+    best_win_rate, epochs_no_improve, patience = -1.0, 0, 10
 
     for epoch in range(config.num_epochs):
         model.train()
         total_loss = 0
-        for states, actions, rtgs in train_loader:
-            states, actions, rtgs = states.to(device), actions.to(device), rtgs.to(device)
+        for states, actions, advantages in train_loader:
+            states = states.to(device)
+            actions = actions.to(device)
+            advantages = advantages.to(device)
 
             # We predict each action given the history up to that point
             # So, the input actions should be shifted
             # a_hat_t = model(s_0, a_0, rtg_0, ..., s_t, a_t, rtg_t)
             # The model predicts the action for the *next* state based on the current one
-            action_preds = model(states, actions, rtgs)
+            action_preds = model(states, actions, advantages)
 
             # The target is the action sequence
             # We flatten batch and sequence dimensions for the loss function
@@ -427,19 +382,17 @@ def validate(model: nn.Module, config: Config, device: torch.device, writer: Sum
             model_as_p2_count += 1
 
         state_hist, action_hist = [], []
-        # We start with a target return of 1.0 (a win)
-        target_return = 1.0
-        rtg_hist = [target_return]
-
-        agents = {1: model_agent if model_plays_as == 1 else random_agent,
-                  -1: model_agent if model_plays_as == -1 else random_agent}
-
+        # --- MODIFIED: Prompt with a high target advantage ---
+        target_advantage = 1.0
+        advantage_hist = [target_advantage]
+        
+        agents = {1: model_agent if model_plays_as == 1 else random_agent, -1: model_agent if model_plays_as == -1 else random_agent}
         done = False
         while not done:
             state_before_move = game.get_state()
 
             current_agent = agents[game.current_player]
-            move = current_agent.get_move(game, state_hist, action_hist, rtg_hist)
+            move = current_agent.get_move(game, state_hist, action_hist, advantage_hist)
 
             # Record the state and action that led to the new state
             state_hist.append(state_before_move)
@@ -447,10 +400,11 @@ def validate(model: nn.Module, config: Config, device: torch.device, writer: Sum
 
             _, reward, done = game.make_move(move)
 
-            # Update the return-to-go for the next step. In Tic-Tac-Toe, rewards are
-            # zero until the end, so the RTG for the next step is the same as the current.
-            # In games with intermediate rewards, this would be: rtg_hist[-1] - reward
-            rtg_hist.append(rtg_hist[-1])
+            # Update the return-to-go for the next step. In Tic-Tac-Toe, rewards are zero
+            # until the end, so the advantage for the next step is the same as the
+            # current.  In games with intermediate rewards, this would be:
+            # advantage_hist[-1] - reward
+            advantage_hist.append(advantage_hist[-1])
 
         winner = game.check_winner()
         if winner == 0:
