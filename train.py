@@ -547,7 +547,7 @@ def main():
     for field_name, field_info in Config.__dataclass_fields__.items():
         if field_name == 'args': continue
         if field_info.type == bool:
-            parser.add_argument(f"--{field_name}", action=argparse.BooleanOptionalAction, default=field_info.default)
+            parser.add_argument(f"--{field_name}", action=argparse.BooleanOptionalAction, default=None, required=True)
         else:
             parser.add_argument(f"--{field_name}", type=field_info.type, default=field_info.default)
 
